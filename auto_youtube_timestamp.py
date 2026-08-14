@@ -18,12 +18,38 @@ def main():
         print("エラー: GEMINI_API_KEY が設定されていません。")
         return
         
-    # 1. チャンネルから最新のライブ完了動画を特定
-    dump_cmd = ["yt-dlp", "--dump-single-json", "--playlist-end", "3", CHANNEL_PLAYLIST_URL]
-    out = subprocess.check_output(dump_cmd)
-    data = json.loads(out.decode("utf-8", errors="ignore"))
-    entries = data.get("entries", [])
+    # 1. チャンネルから最新のライブ完了動画を特定（YouTube Botブロック回避オプションを付与）
+    dump_cmd = [
+        "yt-dlp",
+        "--user-agent", "Mozilla/5.0",
+        "--extractor-args", "youtube:player_client=android,web",
+        "--dump-single-json",
+        "--playlist-end", "3",
+        CHANNEL_PLAYLIST_URL
+    ]
     
+    try:
+        out = subprocess.check_output(dump_cmd)
+        data = json.loads(out.decode("utf-8", errors="ignore"))
+        entries = data.get("entries", [])
+    except Exception as e:
+        print("プレイリスト取得エラー（フォールバック試行）:", e)
+        # 直接チャンネル動画一覧からフォールバック取得
+        fb_cmd = [
+            "yt-dlp",
+            "--user-agent", "Mozilla/5.0",
+            "--extractor-args", "youtube:player_client=android,web",
+            "--dump-json",
+            "https://www.youtube.com/@RyotoV/streams"
+        ]
+        try:
+            out = subprocess.check_output(fb_cmd)
+            lines = out.decode("utf-8", errors="ignore").strip().split("\n")
+            entries = [json.loads(line) for line in lines if line.strip()]
+        except Exception as e2:
+            print("フォールバック取得エラー:", e2)
+            entries = []
+
     if not entries:
         print("動画が見つかりませんでした。")
         return
@@ -34,7 +60,7 @@ def main():
     
     print(f"最新の動画を検知しました: ID={video_id} | Title={video_title}")
     
-    # 2. 動画ストリームの一括取得 (403回避オプション付き)
+    # 2. 動画ストリームの一括取得 (403/Bot回避オプション付き)
     local_video_path = f"stream_{video_id}.mp4"
     if not os.path.exists(local_video_path):
         print(f"動画ストリームを取得中 ({video_id})...")
