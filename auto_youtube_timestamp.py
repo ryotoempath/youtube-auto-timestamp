@@ -8,8 +8,31 @@ import cv2
 
 CHANNEL_PLAYLIST_URL = "https://www.youtube.com/playlist?list=UUsei55iBwnVsqClwwpvmzrw"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GAS_WEBAPP_URL = os.environ.get("GAS_WEBAPP_URL", "")
+GAS_WEBAPP_URL = os.environ.get("GAS_WEBAPP_URL", "https://script.google.com/macros/s/AKfycbx-Si2brMAVjlaQyRnoOmqeu8lO-Tv2t1xbwUytG3bWPJR6PCtJxUE8g0A53uz61k_vRA/exec")
 AUTO_SECRET = os.environ.get("AUTO_SECRET", "ryoto_timestamp_secret")
+
+def get_latest_completed_video():
+    """アーカイブ処理中の動画を回避し、最新の配信完了アーカイブを確実に取得"""
+    cmd = [
+        "yt-dlp",
+        "--user-agent", "Mozilla/5.0",
+        "--extractor-args", "youtube:player_client=android,web",
+        "--dump-json",
+        "https://www.youtube.com/@RyotoV/streams"
+    ]
+    try:
+        out = subprocess.check_output(cmd)
+        lines = out.decode("utf-8", errors="ignore").strip().split("\n")
+        for line in lines:
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            # 生配信中ではなく、動画が完了しているものを選択
+            if entry.get("was_live") or entry.get("duration"):
+                return entry
+    except Exception as e:
+        print("ストリーム一覧取得エラー:", e)
+    return None
 
 def main():
     print("=== 【りょーとV 全自動タイムスタンプ解析・更新システム】起動 ===")
@@ -18,49 +41,17 @@ def main():
         print("エラー: GEMINI_API_KEY が設定されていません。")
         return
         
-    # 1. チャンネルから最新のライブ完了動画を特定（YouTube Botブロック回避オプションを付与）
-    dump_cmd = [
-        "yt-dlp",
-        "--user-agent", "Mozilla/5.0",
-        "--extractor-args", "youtube:player_client=android,web",
-        "--dump-single-json",
-        "--playlist-end", "3",
-        CHANNEL_PLAYLIST_URL
-    ]
-    
-    try:
-        out = subprocess.check_output(dump_cmd)
-        data = json.loads(out.decode("utf-8", errors="ignore"))
-        entries = data.get("entries", [])
-    except Exception as e:
-        print("プレイリスト取得エラー（フォールバック試行）:", e)
-        # 直接チャンネル動画一覧からフォールバック取得
-        fb_cmd = [
-            "yt-dlp",
-            "--user-agent", "Mozilla/5.0",
-            "--extractor-args", "youtube:player_client=android,web",
-            "--dump-json",
-            "https://www.youtube.com/@RyotoV/streams"
-        ]
-        try:
-            out = subprocess.check_output(fb_cmd)
-            lines = out.decode("utf-8", errors="ignore").strip().split("\n")
-            entries = [json.loads(line) for line in lines if line.strip()]
-        except Exception as e2:
-            print("フォールバック取得エラー:", e2)
-            entries = []
-
-    if not entries:
-        print("動画が見つかりませんでした。")
+    latest_video = get_latest_completed_video()
+    if not latest_video:
+        print("最新の配信動画が見つかりませんでした。")
         return
-    
-    latest_video = entries[0]
+        
     video_id = latest_video.get("id")
     video_title = latest_video.get("title", "")
     
-    print(f"最新の動画を検知しました: ID={video_id} | Title={video_title}")
+    print(f"最新の配信アーカイブを検知しました: ID={video_id} | Title={video_title}")
     
-    # 2. 動画ストリームの一括取得 (403/Bot回避オプション付き)
+    # 2. 動画ストリームの一括取得
     local_video_path = f"stream_{video_id}.mp4"
     if not os.path.exists(local_video_path):
         print(f"動画ストリームを取得中 ({video_id})...")
@@ -126,7 +117,7 @@ def main():
 
 [制約]
 - 見出しの文字数は4〜12文字程度で極めてシンプルに抑えること。
-- 大げさに「〇〇検証」と言わず、「味見」「確認」「日課」「厳選」「雑談」などの自然な言葉選びにすること。
+- 大げさに「〇〇検証」と言わず、「味見」「確認」「日課」「厳選」「M5煌墓」「蝕ティナ」「雑談」などの自然な言葉選びにすること。
 - 画面UI（ダンジョン名、ドロップ画面、ステータス画面、雑談画面等）と時間に合致させて、全体で6〜8項目程度に絞ってタイムスタンプを出力すること。"""
 
     parts = [{"text": prompt}]
@@ -172,8 +163,6 @@ def main():
             res_data = json.loads(gas_res.read().decode("utf-8"))
             print("GAS更新レスポンス:", res_data)
             print("🎉 最新配信アーカイブの概要欄全自動更新が成功しました！")
-    else:
-        print("※ GAS_WEBAPP_URL が設定されていないため、概要欄への自動送信はスキップされました。")
 
 if __name__ == "__main__":
     main()
