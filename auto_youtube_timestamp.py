@@ -140,6 +140,61 @@ def fetch_transcript(video_id: str) -> list[tuple[float, str]] | None:
         return None
 
 
+# ──────────────────────────────────────────────
+# Step 3b: 音声サンプリング + Whisper（字幕無効時のフォールバック）
+# ──────────────────────────────────────────────
+def fetch_transcript_via_audio(video_id: str, duration_sec: float,
+                                num_samples: int = 8,
+                                sample_len: int = 45) -> list[tuple[float, str]] | None:
+    """
+    字幕が取得できない場合のフォールバック。
+    yt-dlp で等間隔に音声クリップを取得し、faster-whisper で文字起こし。
+    """
+    print("  [フォールバック] 音声サンプリング + Whisper 方式で字幕を生成中...")
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        print("  faster-whisper が未インストールのためスキップ")
+        return None
+
+    model = WhisperModel("tiny", device="cpu", compute_type="int8")
+    entries: list[tuple[float, str]] = []
+    interval = duration_sec / (num_samples + 1)
+
+    for i in range(1, num_samples + 1):
+        start_sec = int(interval * i)
+        out_file  = f"clip_{video_id}_{i}.mp3"
+
+        # yt-dlp で音声クリップをダウンロード（特定動画URLへのアクセスは許可されやすい）
+        cmd = [
+            "yt-dlp", "-x",
+            "--audio-format", "mp3",
+            "--audio-quality", "5",
+            "--download-sections", f"*{start_sec}-{start_sec + sample_len}",
+            "-o", out_file,
+            f"https://www.youtube.com/watch?v={video_id}"
+        ]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, timeout=90)
+        except Exception as e:
+            print(f"    クリップ{i}の取得失敗: {e}")
+            continue
+
+        if os.path.exists(out_file):
+            try:
+                segments, _ = model.transcribe(out_file, language="ja")
+                text = " ".join(s.text for s in segments).strip()
+                if text:
+                    entries.append((float(start_sec), text))
+                    h, m, s = start_sec//3600, (start_sec%3600)//60, start_sec%60
+                    print(f"    [{h:02d}:{m:02d}:{s:02d}] {text[:60]}")
+            except Exception as e:
+                print(f"    文字起こし失敗: {e}")
+            finally:
+                os.remove(out_file)
+
+    return entries if entries else None
+
 def sample_transcript(entries: list[tuple[float, str]],
                       interval_sec: int = 1200,
                       max_chars: int = 14000) -> str:
@@ -313,8 +368,15 @@ def main():
     # Step 3: 字幕取得（youtube-transcript-api）
     print("\n[Step 2] 字幕を取得中...")
     entries = fetch_transcript(video_id)
+
+    # 字幕が無効の場合は音声サンプリング + Whisper でフォールバック
     if not entries:
-        print("  字幕が取得できませんでした。終了します。")
+        print("  字幕が取得できませんでした。音声サンプリング方式を試みます...")
+        entries = fetch_transcript_via_audio(video_id, duration_sec)
+
+    if not entries:
+        print("  すべての字幕取得方法が失敗しました。終了します。")
+        print("  ※ライブ配信直後は字幕生成に数時間かかる場合があります。次回の自動実行をお待ちください。")
         return
 
     # Step 4: サンプリング
