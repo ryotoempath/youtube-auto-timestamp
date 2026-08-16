@@ -1,168 +1,349 @@
 import os
+import sys
 import json
-import base64
-import time
+import re
 import subprocess
 import urllib.request
-import cv2
 
-CHANNEL_PLAYLIST_URL = "https://www.youtube.com/playlist?list=UUsei55iBwnVsqClwwpvmzrw"
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GAS_WEBAPP_URL = os.environ.get("GAS_WEBAPP_URL", "https://script.google.com/macros/s/AKfycbx-Si2brMAVjlaQyRnoOmqeu8lO-Tv2t1xbwUytG3bWPJR6PCtJxUE8g0A53uz61k_vRA/exec")
-AUTO_SECRET = os.environ.get("AUTO_SECRET", "ryoto_timestamp_secret")
+if sys.platform == 'win32':
+    sys.stdout.reconfigure(encoding='utf-8')
 
+CHANNEL_ID    = "UCsei55iBwnVsqClwwpvmzrw"
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+GAS_WEBAPP_URL    = os.environ.get("GAS_WEBAPP_URL", "")
+AUTO_SECRET       = os.environ.get("AUTO_SECRET", "ryoto_timestamp_secret")
+CLAUDE_MODEL      = "claude-sonnet-5"
+
+# ──────────────────────────────────────────────
+# Step 1: 最新配信アーカイブ取得
+# ──────────────────────────────────────────────
 def get_latest_completed_video():
-    """アーカイブ処理中の動画を回避し、最新の配信完了アーカイブを確実に取得"""
+    """最新の完了したライブ配信アーカイブを取得する"""
     cmd = [
         "yt-dlp",
         "--user-agent", "Mozilla/5.0",
         "--extractor-args", "youtube:player_client=android,web",
         "--dump-json",
-        "https://www.youtube.com/@RyotoV/streams"
+        "--playlist-end", "5",
+        f"https://www.youtube.com/channel/{CHANNEL_ID}/streams"
     ]
     try:
-        out = subprocess.check_output(cmd)
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
         lines = out.decode("utf-8", errors="ignore").strip().split("\n")
         for line in lines:
             if not line.strip():
                 continue
             entry = json.loads(line)
-            # 生配信中ではなく、動画が完了しているものを選択
+            # was_live または duration があれば配信アーカイブとみなす
             if entry.get("was_live") or entry.get("duration"):
                 return entry
     except Exception as e:
         print("ストリーム一覧取得エラー:", e)
     return None
 
-def main():
-    print("=== 【りょーとV 全自動タイムスタンプ解析・更新システム】起動 ===")
-    
-    if not GEMINI_API_KEY:
-        print("エラー: GEMINI_API_KEY が設定されていません。")
-        return
-        
-    latest_video = get_latest_completed_video()
-    if not latest_video:
-        print("最新の配信動画が見つかりませんでした。")
-        return
-        
-    video_id = latest_video.get("id")
-    video_title = latest_video.get("title", "")
-    
-    print(f"最新の配信アーカイブを検知しました: ID={video_id} | Title={video_title}")
-    
-    # 2. 動画ストリームの一括取得
-    local_video_path = f"stream_{video_id}.mp4"
-    if not os.path.exists(local_video_path):
-        print(f"動画ストリームを取得中 ({video_id})...")
-        dl_cmd = [
-            "yt-dlp",
-            "--user-agent", "Mozilla/5.0",
-            "--extractor-args", "youtube:player_client=android,web",
-            "-f", "18/140/b",
-            "-o", local_video_path,
-            f"https://www.youtube.com/watch?v={video_id}"
-        ]
-        subprocess.run(dl_cmd, check=True)
-    
-    # 3. OpenCV によるキーフレーム抽出 (20分刻み)
-    cap = cv2.VideoCapture(local_video_path)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    duration_sec = total_frames / fps if total_frames > 0 else 12000
-    
-    print(f"実測再生時間: {duration_sec / 3600:.2f}時間 ({duration_sec:.1f}秒)")
-    
-    interval_sec = 1200
-    extracted_frames = []
-    sec = 0
-    while sec < duration_sec:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(sec * fps))
-        ret, frame = cap.read()
-        if ret:
-            _, buf = cv2.imencode(".jpg", frame)
-            b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
-            hrs, mts, scs = int(sec // 3600), int((sec % 3600) // 60), int(sec % 60)
-            extracted_frames.append({"time": f"{hrs:02d}:{mts:02d}:{scs:02d}", "b64": b64})
-        sec += interval_sec
-    cap.release()
-    
-    print(f"抽出コマ数: {len(extracted_frames)}コマ")
-    
-    # 4. 学習済み【りょーと直筆スタイル】による Gemini AI マルチモーダル解析
-    gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={GEMINI_API_KEY}"
-    
-    prompt = f"""以下は最新のライブ配信『{video_title}』（動画ID: {video_id}）の実際のゲーム配信画面画像群です。
+# ──────────────────────────────────────────────
+# Step 2: 重複スキップ判定
+# ──────────────────────────────────────────────
+def already_has_timestamps(description: str) -> bool:
+    """概要欄に既に【タイムスタンプ】ブロックがある場合は True を返す"""
+    return "【タイムスタンプ】" in description
 
-【重要：りょーと直筆公式プロンプトルール】
-以下の「お手本スタイル」を100%真似してタイムスタンプを作成してください。
+# ──────────────────────────────────────────────
+# Step 3: VTT字幕ダウンロード
+# ──────────────────────────────────────────────
+def download_subtitles(video_id: str) -> str | None:
+    """
+    yt-dlp で YouTube の自動生成字幕（日本語）を VTT 形式でダウンロードする。
+    成功時はファイルパス、失敗時は None を返す。
+    """
+    print(f"  字幕ダウンロード中 (video_id={video_id})...")
+    cmd = [
+        "yt-dlp",
+        "--user-agent", "Mozilla/5.0",
+        "--write-auto-sub",
+        "--sub-langs", "ja",
+        "--sub-format", "vtt",
+        "--skip-download",
+        "-o", f"sub_{video_id}",
+        f"https://www.youtube.com/watch?v={video_id}"
+    ]
+    try:
+        subprocess.run(cmd, check=True, stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError as e:
+        print("  字幕取得エラー:", e)
+        return None
 
-[お手本サンプル1]
-- 00:00:00 待機画面
-- 00:02:15 配信開始（日課）
-- 00:34:00 双炎確認
-- 00:46:00 炎舞型味見
-- 01:24:00 レグティニス遺跡
-- 02:21:00 迷霧の森 攻略
-- 04:02:00 まとめ＆雑談
+    # ファイル名候補を探す（yt-dlp のバージョンで若干異なる）
+    for fname in [
+        f"sub_{video_id}.ja.vtt",
+        f"sub_{video_id}.ja-auto.vtt",
+    ]:
+        if os.path.exists(fname):
+            print(f"  [OK] 字幕ファイル取得: {fname}")
+            return fname
 
-[お手本サンプル2]
-- 00:00:00 待機画面
-- 00:02:30 配信開始（日課）
-- 00:38:00 双炎型確認
-- 01:00:00 ワールドレイド
-- 01:25:00 M5工場（首飾り厳選）
-- 02:30:00 装備調整＆雑談
-- 03:25:00 まとめ＆雑談
+    print("  字幕ファイルが見つかりませんでした。")
+    return None
 
-[制約]
-- 見出しの文字数は4〜12文字程度で極めてシンプルに抑えること。
-- 大げさに「〇〇検証」と言わず、「味見」「確認」「日課」「厳選」「M5煌墓」「蝕ティナ」「雑談」などの自然な言葉選びにすること。
-- 画面UI（ダンジョン名、ドロップ画面、ステータス画面、雑談画面等）と時間に合致させて、全体で6〜8項目程度に絞ってタイムスタンプを出力すること。"""
+# ──────────────────────────────────────────────
+# Step 4: VTTパース & サンプリング
+# ──────────────────────────────────────────────
+def parse_vtt(vtt_path: str) -> list[tuple[float, str]]:
+    """
+    VTT ファイルをパースし (秒数, テキスト) のリストを返す。
+    YouTube 自動字幕特有のインライン timestamp タグも除去する。
+    """
+    try:
+        with open(vtt_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+    except Exception as e:
+        print("  VTT読み込みエラー:", e)
+        return []
 
-    parts = [{"text": prompt}]
-    for item in extracted_frames:
-        parts.append({"text": f"\n--- タイムコード [{item['time']}] の実際の配信画面画像 ---"})
-        parts.append({"inline_data": {"mime_type": "image/jpeg", "data": item["b64"]}})
+    entries: list[tuple[float, str]] = []
+    seen_texts: set[str] = set()   # 連続重複の除去用
 
-    payload = {"contents": [{"parts": parts}]}
+    # "HH:MM:SS.mmm --> HH:MM:SS.mmm" の行の後のテキストを取得
+    blocks = re.split(r"\n\n+", content)
+    for block in blocks:
+        lines = block.strip().splitlines()
+        # タイムコード行を探す
+        ts_line = None
+        text_lines = []
+        for line in lines:
+            if re.match(r"\d{2}:\d{2}:\d{2}", line):
+                ts_line = line
+            elif ts_line and line and not line.startswith("NOTE"):
+                text_lines.append(line)
+
+        if not ts_line or not text_lines:
+            continue
+
+        # タイムスタンプを秒数に変換
+        m = re.match(r"(\d{2}):(\d{2}):(\d{2})\.(\d+)", ts_line)
+        if not m:
+            continue
+        sec = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+
+        # テキストの整形（VTT タグ・空行を除去）
+        raw_text = " ".join(text_lines)
+        text = re.sub(r"<[^>]+>", "", raw_text).strip()
+        text = re.sub(r"\s+", " ", text)
+        if not text or text in seen_texts:
+            continue
+        seen_texts.add(text)
+
+        entries.append((float(sec), text))
+
+    return entries
+
+
+def sample_transcript(entries: list[tuple[float, str]],
+                      interval_sec: int = 1200,
+                      max_chars: int = 14000) -> str:
+    """
+    字幕エントリを interval_sec（デフォルト20分）ごとのブロックに区切り、
+    各ブロックの先頭タイムスタンプと代表テキストをまとめてサンプリングする。
+
+    Claude が「この時間帯にこの話題があった」と正確に把握できる形式で出力する。
+    """
+    if not entries:
+        return ""
+
+    blocks: list[str] = []
+    block_start = 0
+    block_texts: list[str] = []
+
+    def fmt_sec(s: int) -> str:
+        return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+
+    for sec, text in entries:
+        if sec >= block_start + interval_sec:
+            if block_texts:
+                header = fmt_sec(int(block_start))
+                summary = "／".join(block_texts[:12])  # 最大12フレーズ
+                blocks.append(f"[{header}頃] {summary}")
+            block_start = (int(sec) // interval_sec) * interval_sec
+            block_texts = [text]
+        else:
+            block_texts.append(text)
+
+    # 最後のブロック
+    if block_texts:
+        header = fmt_sec(int(block_start))
+        blocks.append(f"[{header}頃] " + "／".join(block_texts[:12]))
+
+    result = "\n".join(blocks)
+    if len(result) > max_chars:
+        result = result[:max_chars] + "\n...(以降省略)"
+    return result
+
+# ──────────────────────────────────────────────
+# Step 5: Claude API でタイムスタンプ生成
+# ──────────────────────────────────────────────
+def call_claude_api(video_title: str, video_id: str,
+                    duration_sec: float, sampled_transcript: str) -> str | None:
+    """
+    Claude API にサンプリング済み字幕を渡し、内容一致のタイムスタンプを生成する。
+    """
+    if not ANTHROPIC_API_KEY:
+        print("  ANTHROPIC_API_KEY が未設定です。")
+        return None
+
+    duration_h = duration_sec / 3600
+
+    prompt = f"""あなたはYouTubeライブ配信のタイムスタンプ作成の専門家です。
+以下の配信アーカイブの**実際の字幕データ（20分ブロック区切り）**を分析し、
+視聴者が内容を把握しやすい日本語タイムスタンプを作成してください。
+
+配信タイトル: 『{video_title}』
+動画ID: {video_id}
+配信時間: 約{duration_h:.1f}時間
+
+【字幕データ（20分ごとブロック）】
+{sampled_transcript}
+
+【タイムスタンプ作成ルール】
+1. 「HH:MM:SS タイトル」形式のみで出力すること（例: 00:02:15 配信開始）
+2. 00:00:00 から始めること
+3. 30分置き程度（内容区切りに応じて20〜40分で調整可）で 6〜9 項目
+4. 各項目は字幕データの「その時間帯の実際の発言・内容」を元に具体的に書くこと
+5. スタレゾ（スターレゾナンス）の固有名詞（双炎・煌墓・M5等）はそのまま使用
+6. タイムスタンプ行のみを出力し、前置きや説明・markdown記号は不要
+
+【出力例】
+00:00:00 待機画面
+00:02:15 配信開始・日課周回
+00:34:00 双炎確認
+01:24:00 レグティニス遺跡
+02:21:00 M5煌墓 攻略
+04:02:00 まとめ＆雑談"""
+
+    payload = {
+        "model": CLAUDE_MODEL,
+        "max_tokens": 1024,
+        "messages": [{"role": "user", "content": prompt}]
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01"
+    }
+
+    try:
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=60) as res:
+            json_res = json.loads(res.read().decode("utf-8"))
+            result = json_res["content"][0]["text"].strip()
+            return result
+    except Exception as e:
+        print("  Claude APIエラー:", e)
+        return None
+
+# ──────────────────────────────────────────────
+# Step 6: GAS WebApp へ POST
+# ──────────────────────────────────────────────
+def post_to_gas(video_id: str, timestamps_text: str) -> bool:
+    """生成したタイムスタンプを GAS WebApp に POST して概要欄を更新する"""
+    if not GAS_WEBAPP_URL:
+        print("  GAS_WEBAPP_URL が未設定です。")
+        return False
+
+    payload = {
+        "videoId": video_id,
+        "timestampsText": timestamps_text,
+        "secret": AUTO_SECRET
+    }
     headers = {"Content-Type": "application/json"}
 
-    result_timestamps = ""
-    for attempt in range(1, 5):
-        try:
-            req = urllib.request.Request(gemini_url, data=json.dumps(payload).encode("utf-8"), headers=headers)
-            with urllib.request.urlopen(req) as res:
-                json_res = json.loads(res.read().decode("utf-8"))
-                result_timestamps = json_res["candidates"][0]["content"]["parts"][0]["text"].strip()
-                print("=== 生成完了したタイムスタンプ ===")
-                print(result_timestamps)
-                break
-        except Exception as e:
-            print(f"Gemini API 試行{attempt} エラー:", e)
-            time.sleep(4)
+    try:
+        req = urllib.request.Request(
+            GAS_WEBAPP_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=30) as res:
+            result = json.loads(res.read().decode("utf-8"))
+        if result.get("status") == "success":
+            print(f"  ✅ 概要欄の更新に成功しました: {video_id}")
+            return True
+        else:
+            print(f"  ❌ GAS エラー: {result.get('message', 'Unknown error')}")
+            return False
+    except Exception as e:
+        print("  GAS POST エラー:", e)
+        return False
 
-    if not result_timestamps:
-        print("タイムスタンプの生成に失敗しました。")
+# ──────────────────────────────────────────────
+# メイン処理
+# ──────────────────────────────────────────────
+def main():
+    print("=== 【りょーとV 全自動タイムスタンプ解析・更新システム】===")
+    print(f"  使用モデル: {CLAUDE_MODEL}\n")
+
+    # Step 1: 最新配信アーカイブ取得
+    print("[Step 1] 最新配信アーカイブを検索中...")
+    latest_video = get_latest_completed_video()
+    if not latest_video:
+        print("  最新の配信動画が見つかりませんでした。終了します。")
         return
 
-    # 一時動画ファイルのクレンジング
-    if os.path.exists(local_video_path):
-        os.remove(local_video_path)
+    video_id    = latest_video.get("id")
+    video_title = latest_video.get("title", "")
+    duration_sec = float(latest_video.get("duration", 12000))
+    description  = latest_video.get("description", "")
 
-    # 5. GAS WebApp へ更新リクエストを送信
-    if GAS_WEBAPP_URL:
-        print(f"GAS WebApp へ自動送信中 ({GAS_WEBAPP_URL})...")
-        gas_payload = {
-            "videoId": video_id,
-            "timestampsText": result_timestamps,
-            "secret": AUTO_SECRET
-        }
-        gas_req = urllib.request.Request(GAS_WEBAPP_URL, data=json.dumps(gas_payload).encode("utf-8"), headers=headers)
-        with urllib.request.urlopen(gas_req) as gas_res:
-            res_data = json.loads(gas_res.read().decode("utf-8"))
-            print("GAS更新レスポンス:", res_data)
-            print("🎉 最新配信アーカイブの概要欄全自動更新が成功しました！")
+    print(f"  動画ID  : {video_id}")
+    print(f"  タイトル: {video_title}")
+    print(f"  再生時間: {duration_sec / 3600:.2f}時間")
+
+    # Step 2: 重複スキップ
+    if already_has_timestamps(description):
+        print("\n[Skip] 概要欄に既に【タイムスタンプ】が存在します。処理をスキップします。")
+        return
+
+    # Step 3: VTT字幕ダウンロード
+    print("\n[Step 2] 自動生成字幕をダウンロード中...")
+    vtt_path = download_subtitles(video_id)
+    if not vtt_path:
+        print("  字幕が取得できませんでした。終了します。")
+        return
+
+    # Step 4: VTTパース & サンプリング
+    print("\n[Step 3] 字幕を解析・サンプリング中...")
+    entries = parse_vtt(vtt_path)
+    os.remove(vtt_path)   # クリーンアップ
+
+    if not entries:
+        print("  字幕データが空です。終了します。")
+        return
+
+    sampled = sample_transcript(entries)
+    print(f"  字幕エントリ数    : {len(entries)} 件")
+    print(f"  サンプリング後文字数: {len(sampled)} 文字")
+
+    # Step 5: Claude API でタイムスタンプ生成
+    print(f"\n[Step 4] Claude ({CLAUDE_MODEL}) でタイムスタンプを生成中...")
+    timestamps = call_claude_api(video_title, video_id, duration_sec, sampled)
+    if not timestamps:
+        print("  タイムスタンプ生成に失敗しました。終了します。")
+        return
+
+    print("\n=== 生成されたタイムスタンプ ===")
+    print(timestamps)
+
+    # Step 6: GAS 経由で概要欄を更新
+    print("\n[Step 5] GAS 経由で概要欄を更新中...")
+    post_to_gas(video_id, timestamps)
+
+    print("\n=== 全処理完了 ===")
+
 
 if __name__ == "__main__":
     main()

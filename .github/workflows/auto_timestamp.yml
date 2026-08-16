@@ -2,9 +2,9 @@ name: Auto YouTube Stream Timestamp Generator
 
 on:
   schedule:
-    # 毎日 朝5:00 JST (UTC 20:00) に自動実行
-    - cron: '0 20 * * *'
-  workflow_dispatch:
+    # 3時間ごとに自動パトロール実行 (全自動)
+    - cron: '0 */3 * * *'
+  workflow_dispatch: # 手動実行ボタンも配置
 
 jobs:
   auto-timestamp:
@@ -18,14 +18,15 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Dependencies
+      - name: Install Dependencies & ffmpeg
         run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg
           python -m pip install --upgrade pip
-          pip install opencv-python-headless yt-dlp
+          pip install yt-dlp
 
       - name: Run Auto Timestamp Generator
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GAS_WEBAPP_URL: ${{ secrets.GAS_WEBAPP_URL }}
           AUTO_SECRET: ${{ secrets.AUTO_SECRET }}
         run: |
