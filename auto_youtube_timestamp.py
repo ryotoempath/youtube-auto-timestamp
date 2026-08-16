@@ -4,42 +4,96 @@ import json
 import re
 import subprocess
 import urllib.request
+import urllib.parse
 
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8')
 
-CHANNEL_ID    = "UCsei55iBwnVsqClwwpvmzrw"
+CHANNEL_ID        = "UCsei55iBwnVsqClwwpvmzrw"
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+YOUTUBE_API_KEY   = os.environ.get("YOUTUBE_API_KEY", "")
 GAS_WEBAPP_URL    = os.environ.get("GAS_WEBAPP_URL", "")
 AUTO_SECRET       = os.environ.get("AUTO_SECRET", "ryoto_timestamp_secret")
 CLAUDE_MODEL      = "claude-sonnet-5"
 
 # ──────────────────────────────────────────────
-# Step 1: 最新配信アーカイブ取得
+# Step 1: 最新配信アーカイブ取得（YouTube Data API v3）
 # ──────────────────────────────────────────────
+def parse_iso_duration(duration: str) -> float:
+    """ISO 8601 duration (PT1H30M45S) を秒数に変換"""
+    m = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?', duration or "")
+    if not m:
+        return 12000.0
+    h  = int(m.group(1) or 0)
+    mi = int(m.group(2) or 0)
+    s  = int(m.group(3) or 0)
+    return float(h * 3600 + mi * 60 + s)
+
 def get_latest_completed_video():
-    """最新の完了したライブ配信アーカイブを取得する"""
-    cmd = [
-        "yt-dlp",
-        "--user-agent", "Mozilla/5.0",
-        "--extractor-args", "youtube:player_client=android,web",
-        "--dump-json",
-        "--playlist-end", "5",
-        f"https://www.youtube.com/channel/{CHANNEL_ID}/streams"
-    ]
+    """
+    YouTube Data API v3 で最新の完了済みライブ配信アーカイブを取得する。
+    GitHub Actions の IP ブロック問題を回避するために公式 API を使用。
+    """
+    if not YOUTUBE_API_KEY:
+        print("  YOUTUBE_API_KEY が未設定です。")
+        return None
+
+    # ① 最新の完了済みライブ配信を検索（最大5件）
+    search_params = urllib.parse.urlencode({
+        "part": "snippet",
+        "channelId": CHANNEL_ID,
+        "eventType": "completed",
+        "type": "video",
+        "order": "date",
+        "maxResults": "5",
+        "key": YOUTUBE_API_KEY
+    })
+    search_url = f"https://www.googleapis.com/youtube/v3/search?{search_params}"
+
     try:
-        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
-        lines = out.decode("utf-8", errors="ignore").strip().split("\n")
-        for line in lines:
-            if not line.strip():
-                continue
-            entry = json.loads(line)
-            # was_live または duration があれば配信アーカイブとみなす
-            if entry.get("was_live") or entry.get("duration"):
-                return entry
+        with urllib.request.urlopen(search_url, timeout=15) as res:
+            search_data = json.loads(res.read().decode())
     except Exception as e:
-        print("ストリーム一覧取得エラー:", e)
-    return None
+        print(f"  YouTube Search API エラー: {e}")
+        return None
+
+    items = search_data.get("items", [])
+    if not items:
+        print("  完了済みライブ配信が見つかりませんでした。")
+        return None
+
+    video_id = items[0]["id"]["videoId"]
+
+    # ② 動画の詳細情報を取得（duration / description）
+    detail_params = urllib.parse.urlencode({
+        "part": "snippet,contentDetails",
+        "id": video_id,
+        "key": YOUTUBE_API_KEY
+    })
+    detail_url = f"https://www.googleapis.com/youtube/v3/videos?{detail_params}"
+
+    try:
+        with urllib.request.urlopen(detail_url, timeout=15) as res:
+            detail_data = json.loads(res.read().decode())
+    except Exception as e:
+        print(f"  YouTube Videos API エラー: {e}")
+        return None
+
+    if not detail_data.get("items"):
+        print(f"  動画詳細の取得に失敗しました: {video_id}")
+        return None
+
+    item         = detail_data["items"][0]
+    snippet      = item["snippet"]
+    duration_sec = parse_iso_duration(item["contentDetails"].get("duration", ""))
+
+    return {
+        "id":          video_id,
+        "title":       snippet.get("title", ""),
+        "description": snippet.get("description", ""),
+        "duration":    duration_sec,
+        "was_live":    True
+    }
 
 # ──────────────────────────────────────────────
 # Step 2: 重複スキップ判定
