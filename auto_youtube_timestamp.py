@@ -103,93 +103,34 @@ def already_has_timestamps(description: str) -> bool:
     return "【タイムスタンプ】" in description
 
 # ──────────────────────────────────────────────
-# Step 3: VTT字幕ダウンロード
+# Step 3: 字幕取得（youtube-transcript-api）
 # ──────────────────────────────────────────────
-def download_subtitles(video_id: str) -> str | None:
+def fetch_transcript(video_id: str) -> list[tuple[float, str]] | None:
     """
-    yt-dlp で YouTube の自動生成字幕（日本語）を VTT 形式でダウンロードする。
-    成功時はファイルパス、失敗時は None を返す。
+    youtube-transcript-api で日本語字幕を取得する。
+    yt-dlp と異なり GitHub Actions の IP でブロックされにくく安定。
+    戻り値: [(秒数, テキスト), ...] のリスト、失敗時は None
     """
-    print(f"  字幕ダウンロード中 (video_id={video_id})...")
-    cmd = [
-        "yt-dlp",
-        "--user-agent", "Mozilla/5.0",
-        "--write-auto-sub",
-        "--sub-langs", "ja",
-        "--sub-format", "vtt",
-        "--skip-download",
-        "-o", f"sub_{video_id}",
-        f"https://www.youtube.com/watch?v={video_id}"
-    ]
+    print(f"  字幕取得中 (video_id={video_id})...")
     try:
-        subprocess.run(cmd, check=True, stderr=subprocess.PIPE)
-    except subprocess.CalledProcessError as e:
-        print("  字幕取得エラー:", e)
-        return None
+        from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound
+        # 日本語優先、なければ英語にフォールバック
+        try:
+            transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['ja'])
+        except NoTranscriptFound:
+            print("  日本語字幕なし。英語でフォールバック...")
+            transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['en'])
 
-    # ファイル名候補を探す（yt-dlp のバージョンで若干異なる）
-    for fname in [
-        f"sub_{video_id}.ja.vtt",
-        f"sub_{video_id}.ja-auto.vtt",
-    ]:
-        if os.path.exists(fname):
-            print(f"  [OK] 字幕ファイル取得: {fname}")
-            return fname
-
-    print("  字幕ファイルが見つかりませんでした。")
-    return None
-
-# ──────────────────────────────────────────────
-# Step 4: VTTパース & サンプリング
-# ──────────────────────────────────────────────
-def parse_vtt(vtt_path: str) -> list[tuple[float, str]]:
-    """
-    VTT ファイルをパースし (秒数, テキスト) のリストを返す。
-    YouTube 自動字幕特有のインライン timestamp タグも除去する。
-    """
-    try:
-        with open(vtt_path, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read()
+        entries = [
+            (float(item['start']), item['text'].strip())
+            for item in transcript
+            if item.get('text', '').strip()
+        ]
+        print(f"  [OK] 字幕取得完了: {len(entries)} エントリ")
+        return entries
     except Exception as e:
-        print("  VTT読み込みエラー:", e)
-        return []
-
-    entries: list[tuple[float, str]] = []
-    seen_texts: set[str] = set()   # 連続重複の除去用
-
-    # "HH:MM:SS.mmm --> HH:MM:SS.mmm" の行の後のテキストを取得
-    blocks = re.split(r"\n\n+", content)
-    for block in blocks:
-        lines = block.strip().splitlines()
-        # タイムコード行を探す
-        ts_line = None
-        text_lines = []
-        for line in lines:
-            if re.match(r"\d{2}:\d{2}:\d{2}", line):
-                ts_line = line
-            elif ts_line and line and not line.startswith("NOTE"):
-                text_lines.append(line)
-
-        if not ts_line or not text_lines:
-            continue
-
-        # タイムスタンプを秒数に変換
-        m = re.match(r"(\d{2}):(\d{2}):(\d{2})\.(\d+)", ts_line)
-        if not m:
-            continue
-        sec = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
-
-        # テキストの整形（VTT タグ・空行を除去）
-        raw_text = " ".join(text_lines)
-        text = re.sub(r"<[^>]+>", "", raw_text).strip()
-        text = re.sub(r"\s+", " ", text)
-        if not text or text in seen_texts:
-            continue
-        seen_texts.add(text)
-
-        entries.append((float(sec), text))
-
-    return entries
+        print(f"  字幕取得エラー: {e}")
+        return None
 
 
 def sample_transcript(entries: list[tuple[float, str]],
@@ -362,24 +303,17 @@ def main():
         print("\n[Skip] 概要欄に既に【タイムスタンプ】が存在します。処理をスキップします。")
         return
 
-    # Step 3: VTT字幕ダウンロード
-    print("\n[Step 2] 自動生成字幕をダウンロード中...")
-    vtt_path = download_subtitles(video_id)
-    if not vtt_path:
+    # Step 3: 字幕取得（youtube-transcript-api）
+    print("\n[Step 2] 字幕を取得中...")
+    entries = fetch_transcript(video_id)
+    if not entries:
         print("  字幕が取得できませんでした。終了します。")
         return
 
-    # Step 4: VTTパース & サンプリング
-    print("\n[Step 3] 字幕を解析・サンプリング中...")
-    entries = parse_vtt(vtt_path)
-    os.remove(vtt_path)   # クリーンアップ
-
-    if not entries:
-        print("  字幕データが空です。終了します。")
-        return
-
+    # Step 4: サンプリング
+    print("\n[Step 3] 字幕をサンプリング中...")
     sampled = sample_transcript(entries)
-    print(f"  字幕エントリ数    : {len(entries)} 件")
+    print(f"  字幕エントリ数      : {len(entries)} 件")
     print(f"  サンプリング後文字数: {len(sampled)} 文字")
 
     # Step 5: Claude API でタイムスタンプ生成
