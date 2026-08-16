@@ -107,25 +107,32 @@ def already_has_timestamps(description: str) -> bool:
 # ──────────────────────────────────────────────
 def fetch_transcript(video_id: str) -> list[tuple[float, str]] | None:
     """
-    youtube-transcript-api で日本語字幕を取得する。
-    yt-dlp と異なり GitHub Actions の IP でブロックされにくく安定。
+    youtube-transcript-api v0.5 で日本語字幕を取得する。
+    GitHub Actions の IP でブロックされにくく安定。
     戻り値: [(秒数, テキスト), ...] のリスト、失敗時は None
     """
     print(f"  字幕取得中 (video_id={video_id})...")
     try:
         from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound
-        # 日本語優先、なければ英語にフォールバック
+
+        def _to_entries(raw) -> list[tuple[float, str]]:
+            """dict形式(v0.5)・オブジェクト形式(v0.6+)どちらにも対応"""
+            result = []
+            for item in raw:
+                text  = item['text']  if isinstance(item, dict) else item.text
+                start = item['start'] if isinstance(item, dict) else item.start
+                text  = (text or "").strip()
+                if text:
+                    result.append((float(start), text))
+            return result
+
         try:
-            transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['ja'])
+            raw = YouTubeTranscriptApi.get_transcript(video_id, languages=['ja'])
         except NoTranscriptFound:
             print("  日本語字幕なし。英語でフォールバック...")
-            transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['en'])
+            raw = YouTubeTranscriptApi.get_transcript(video_id, languages=['en'])
 
-        entries = [
-            (float(item['start']), item['text'].strip())
-            for item in transcript
-            if item.get('text', '').strip()
-        ]
+        entries = _to_entries(raw)
         print(f"  [OK] 字幕取得完了: {len(entries)} エントリ")
         return entries
     except Exception as e:

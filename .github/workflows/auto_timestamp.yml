@@ -22,7 +22,7 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y ffmpeg
           python -m pip install --upgrade pip
-          pip install yt-dlp youtube-transcript-api
+          pip install yt-dlp "youtube-transcript-api==0.5.0"
 
       - name: Run Auto Timestamp Generator
         env:
@@ -32,3 +32,4 @@ jobs:
           AUTO_SECRET: ${{ secrets.AUTO_SECRET }}
         run: |
           python auto_youtube_timestamp.py
+
